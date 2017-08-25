@@ -1,4 +1,4 @@
-﻿# Find-Logons.ps1
+# Find-Logons.ps1
 # author: Tony M Lambert
 #
 # params: -user <username> -outPath <folder>
@@ -24,7 +24,7 @@ $logonSubstatusTable = @{'C0000064'='user name does not exist';
                     'C0000133'='clocks between DC and other computer too far out of sync';
                     'C0000224'='user is required to change password at next logon';
                     'C0000225'='evidently a bug in Windows and not a risk';
-                    'C000015b'='The user has not been granted the requested logon type (aka logon right) at this machine}';}
+                    'C000015b'='The user has not been granted the requested logon type (aka logon right) at this machine';}
 
 # Hash table containing failed kerberos preauth status codes
 $kerberosStatusTable = @{'1'="Client's entry in database has expired"
@@ -44,13 +44,13 @@ $kerberosStatusTable = @{'1'="Client's entry in database has expired"
                             'F'="KDC has no support for checksum type"
                             '10'="KDC has no support for padata type"
                             '11'="KDC has no support for transited type"
-                            '12'="Clients credentials have been revoked"
+                            '12'="Clients credentials have been revoked (probably already locked)"
                             '13'="Credentials for server have been revoked"
                             '14'="TGT has been revoked"
                             '15'="Client not yet valid - try again later"
                             '16'="Server not yet valid - try again later"
                             '17'="Password has expired"
-                            '18'="Pre-authentication information was invalid"
+                            '18'="Pre-authentication information was invalid (bad credentials)"
                             '19'="Additional pre-authentication required*"
                             '1F'="Integrity check on decrypted field failed"
                             '20'="Ticket expired"
@@ -80,7 +80,10 @@ $PDC = Get-ADDomainController -Discover -Service PrimaryDC
 
 # Find domain controllers for domain
 
-$domainControllers = (Get-ADDomainController -Filter * -Server $currentDNSRoot) 
+$domainControllers = (Get-ADDomainController -Filter * -Server $currentDNSRoot)
+
+# List client access servers for Exchange
+$exchangeServers = @()
 
 #Detect if output path is valid
 #If not, create it
@@ -94,9 +97,10 @@ if(!(Test-Path -Path $outPath ))
 try
 {
     Write-Host "Looking up user properties..."
-    $userProperties = Get-ADUser -Identity $user -Properties * -ErrorAction Stop 
+    $userProperties = Get-ADUser -Identity $user -Properties * -ErrorAction Stop
     $userProperties | Out-File -Append $outPath\$user.properties.txt -width 250
     Write-Host "Done! Output at $outPath\$user.properties.txt"
+    $userEmailAddress = (get-aduser -Identity $user -Properties EmailAddress).EmailAddress
 }
 catch
 {
@@ -111,7 +115,19 @@ catch
 # Get lockout events from PDC
 Write-Host "Proceeding to look up lockout events..."
 
-$lockoutEvents = get-winevent -computername $PDC -logname Security -FilterXPath "*[System[EventID=4740] and EventData[Data[@Name='TargetUserName']='$user']]" -ErrorAction SilentlyContinue `
+$query = @"
+    <QueryList> 
+           <Query Id="0"> 
+              <Select Path="Security"> 
+                *[System[(EventID='4740')]] 
+                and
+                *[EventData[Data[@Name='TargetUserName'] and (Data='$user' or Data='$userEmailAddress')]]                         
+               </Select> 
+           </Query> 
+    </QueryList>
+"@
+
+$lockoutEvents = get-winevent -computername $PDC -logname Security -FilterXPath $query -ErrorAction SilentlyContinue `
 | Select-Object TimeCreated,@{Name='User Name';Expression={$_.Properties[0].Value}},@{Name='Source Host';Expression={$_.Properties[1].Value}}`
 | Format-Table -Property * -AutoSize
 $lockoutEvents | out-file -Append $outPath\$user.lockouts.txt
@@ -125,26 +141,107 @@ Write-Host "Done! Output at $outPath\$user.lockouts.txt"
 # Get failed logon events from PDC
 Write-Host "Proceeding to look up failed domain logon events..."
 
-$failedDomainLogonEvents = get-winevent -computername $PDC -logname Security -FilterXPath "*[System[EventID=4625] and EventData[Data[@Name='TargetUserName']='$user']]" -ErrorAction SilentlyContinue `
+$query = @"
+    <QueryList> 
+           <Query Id="0"> 
+              <Select Path="Security"> 
+                *[System[(EventID='4625')]] 
+                and
+                *[EventData[Data[@Name='TargetUserName'] and (Data='$user' or Data='$userEmailAddress')]]                         
+               </Select> 
+           </Query> 
+    </QueryList>  
+"@
+
+$failedDomainLogonEvents = get-winevent -computername $PDC -logname Security -FilterXPath $query -ErrorAction SilentlyContinue `
 | Select-Object TimeCreated,@{Name='User Name';Expression={$_.Properties[5].Value}},@{Name='Workstation Name';Expression={$_.Properties[13].Value}},@{Name='Source IP';Expression={$_.Properties[19].Value}},@{Name='Substatus';Expression={$_.Properties[9].Value.ToString('X2') + " - " + $logonSubstatusTable.Item($_.Properties[9].Value.ToString('X2'))}}`
 | Format-Table -Property * -AutoSize
-$failedDomainLogonEvents | out-file -Append $outPath\$user.failed-domain-logons.txt
 
-Write-Host "Done! Output at $outPath\$user.failed-domain-logons.txt"
+#Only output if we have records
+    if ($failedDomainLogonEvents)
+    {
+        $failedDomainLogonEvents | out-file -Append $outPath\$user.failed-domain-logons.txt
+        Write-Host "Done! Output at $outPath\$user.failed-domain-logons.txt"
+    }
+    else 
+    {
+        Write-Host "No failed domain logons..."
+    }
 
 #------------ End Failed Domain Logon Lookup ---------------#
 
+#------------ Failed Exchange Logon Lookup ------------#
+
+# Get failed logon events from Exchange Client Access Servers
+Write-Host "Proceeding to look up failed Exchange logon events..."
+
+$query = @"
+    <QueryList> 
+           <Query Id="0"> 
+              <Select Path="Security"> 
+                *[System[(EventID='4625')]] 
+                and
+                *[EventData[Data[@Name='TargetUserName'] and (Data='$user' or Data='$userEmailAddress')]]                         
+               </Select> 
+           </Query> 
+    </QueryList>
+"@
+
+foreach ($exchangeServer in $exchangeServers)
+{
+    Write-Host "Looking up failed Exchange logon events for $exchangeServer..."
+    $failedExchangeLogonEvents = get-winevent -computername $exchangeServer -logname Security -FilterXPath $query -ErrorAction SilentlyContinue `
+    | Select-Object TimeCreated,@{Name='User Name';Expression={$_.Properties[5].Value}},@{Name='Workstation Name';Expression={$_.Properties[13].Value}},@{Name='Source IP';Expression={$_.Properties[19].Value}},@{Name='Substatus';Expression={$_.Properties[9].Value.ToString('X2') + " - " + $logonSubstatusTable.Item($_.Properties[9].Value.ToString('X2'))}}`
+    | Format-Table -Property * -AutoSize
+    
+    #Only output if we have records
+    if ($failedExchangeLogonEvents)
+    {
+        $failedExchangeLogonEvents | out-file -Append $outPath\$user.failed-exchange-logons.$exchangeServer.txt
+        Write-Host "Done! Output at $outPath\$user.failed-exchange-logons.$exchangeServer.txt"
+    }
+    else 
+    {
+        Write-Host "No failed Exchange logons on $exchangeServer..."
+    }
+    
+}
+
+#------------ End Failed Exchange Logon Lookup ---------------#
+
 #------------ Kerberos Preauthentication Lookup ------------#
 
-# Get failed kerberos preauthentication events from PDC
+# Get failed kerberos preauthentication events from each domain controller
 Write-Host "Proceeding to look up failed kerberos pre-auth events..."
 
-$failedKerberosEvents = get-winevent -computername $PDC -logname Security -FilterXPath "*[System[EventID=4771] and EventData[Data[@Name='TargetUserName']='$user']]" -ErrorAction SilentlyContinue `
-| Select-Object TimeCreated,@{Name='User Name';Expression={$_.Properties[0].Value}},@{Name='Source IP';Expression={$_.Properties[6].Value}},@{Name='Status';Expression={$_.Properties[4].Value.ToString('X2') + "-" + $kerberosStatusTable.Item($_.Properties[4].Value.ToString('X2'))}}`
-| Format-Table -Property * -AutoSize
-$failedKerberosEvents | out-file -Append $outPath\$user.failed-kerberos-preauth.txt
+$query = @"
+    <QueryList> 
+           <Query Id="0"> 
+              <Select Path="Security"> 
+                *[System[(EventID='4771')]] 
+                and
+                *[EventData[Data[@Name='TargetUserName'] and (Data='$user')]]                         
+               </Select> 
+           </Query> 
+    </QueryList>
+     
+"@
 
-Write-Host "Done! Output at $outPath\$user.failed-kerberos-preauth.txt"
+foreach ($domainController in $domainControllers)
+{
+    $failedKerberosEvents = get-winevent -computername $domainController -logname Security -FilterXPath $query -ErrorAction SilentlyContinue `
+    | Select-Object TimeCreated,@{Name='User Name';Expression={$_.Properties[0].Value}},@{Name='Source IP';Expression={$_.Properties[6].Value}},@{Name='Status';Expression={$_.Properties[4].Value.ToString('X2') + "-" + $kerberosStatusTable.Item($_.Properties[4].Value.ToString('X2'))}}`
+    | Format-Table -Property * -AutoSize
+
+    # We only want to output if we have records
+    if ($failedKerberosEvents)
+    {
+        $failedKerberosEvents | out-file -Append $outPath\$user.failed-kerberos-preauth.$domainController.txt
+
+        Write-Host "Done! Output at $outPath\$user.failed-kerberos-preauth.$domainController.txt"
+    }
+    
+}
 
 #------------ End Kerberos Preauthentication Lookup ------------#
 
